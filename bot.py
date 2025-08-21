@@ -6,26 +6,31 @@ from zoneinfo import ZoneInfo
 from timezonefinder import TimezoneFinder
 import random
 import os
+import asyncio
+from fastapi import FastAPI
+import uvicorn
 
+# --- Environment Variables ---
 TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))  # main Discord channel
 
 if not TOKEN or not CHANNEL_ID:
     raise ValueError("TOKEN and CHANNEL_ID must be set in env")
 
+# --- Bot Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- Globals ---
-user_zips = {}            # user_id: {zip, lat, lon}
-posted_alerts = {}        # alert_id: end_datetime
+user_zips = {}          # user_id: {zip, lat, lon}
+posted_alerts = {}      # alert_id: end_datetime
 sandbox_mode = False
 sandbox_channel_id = None
 tf = TimezoneFinder()
-bot_channel = None        # main channel object
+bot_channel = None      # main channel object
 
-# --- Safety advice ---
+# --- Safety Advice ---
 SAFETY_ADVICE = {
     "Tornado Warning": "🌪️ Take shelter immediately in a basement or interior room on the lowest floor, away from windows.",
     "Severe Thunderstorm Warning": "⛈️ Stay indoors, avoid windows, and unplug electronics. Do not drive through flooded roads.",
@@ -39,14 +44,13 @@ SAFETY_ADVICE = {
     "Wildfire Warning": "🔥 Be ready to evacuate if ordered. Avoid breathing smoke and keep N95 masks if available.",
     "Dense Fog Advisory": "🌫️ If driving, use low beams, slow down, and allow extra distance.",
     "Blizzard Warning": "❄️ Avoid travel, stay indoors, and ensure you have food, water, and heat sources.",
-
     # Watches
     "Tornado Watch": "🌪️ Be alert! Conditions are favorable for tornadoes. Stay tuned to local weather updates.",
     "Severe Thunderstorm Watch": "⛈️ Conditions are favorable for severe thunderstorms. Monitor forecasts and be ready to take shelter.",
     "Flash Flood Watch": "🌊 Conditions are favorable for flash flooding. Stay alert and plan how to reach higher ground if needed."
 }
 
-# --- Event shorthand ---
+# --- Event Shorthand ---
 EVENT_SHORTHAND = {
     "tornado": "Tornado Warning",
     "twatch": "Tornado Watch",
@@ -65,7 +69,7 @@ EVENT_SHORTHAND = {
     "blizzard": "Blizzard Warning"
 }
 
-# --- ZIP → lat/lon ---
+# --- Helper Functions ---
 def zip_to_coords(zip_code):
     try:
         url = f"https://nominatim.openstreetmap.org/search?postalcode={zip_code}&country=US&format=json"
@@ -77,7 +81,6 @@ def zip_to_coords(zip_code):
         return None
     return None
 
-# --- UTC → local ---
 def to_local_time(utc_str, lat, lon):
     try:
         if not utc_str:
@@ -91,7 +94,6 @@ def to_local_time(utc_str, lat, lon):
         return utc_str
     return utc_str
 
-# --- Get NOAA alerts ---
 def check_weather_alert(lat, lon):
     url = f"https://api.weather.gov/alerts/active?point={lat},{lon}"
     res = requests.get(url, headers={"User-Agent": "LuminaBot"})
@@ -122,7 +124,20 @@ def check_weather_alert(lat, lon):
                 )
     return new_alerts
 
-# --- Register ZIP ---
+# --- ZenQuotes Integration ---
+def get_quote():
+    try:
+        res = requests.get("https://zenquotes.io/api/random")
+        if res.status_code == 200:
+            data = res.json()
+            if data and isinstance(data, list):
+                q = data[0]
+                return f"{q['q']} — {q['a']}"
+    except Exception as e:
+        print("Error fetching quote:", e)
+    return "Stay positive and keep going!"
+
+# --- Discord Commands ---
 @bot.command()
 async def weather(ctx, zip_code):
     coords = zip_to_coords(zip_code)
@@ -132,7 +147,6 @@ async def weather(ctx, zip_code):
     else:
         await ctx.send("❌ Could not find that ZIP code. Please try again.")
 
-# --- Sandbox toggle ---
 @bot.command()
 async def sandbox(ctx, code: int):
     global sandbox_mode, sandbox_channel_id
@@ -147,7 +161,6 @@ async def sandbox(ctx, code: int):
     else:
         await ctx.send("❌ Invalid sandbox code.")
 
-# --- Sandbox alert ---
 @bot.command()
 async def alert(ctx, code: str = None, zip_code: str = None):
     if not sandbox_mode:
@@ -178,7 +191,7 @@ async def alert(ctx, code: str = None, zip_code: str = None):
     if target_channel:
         await target_channel.send(msg)
 
-# --- Monitor alerts every hour ---
+# --- Discord Tasks ---
 @tasks.loop(minutes=60)
 async def weather_monitor():
     now = datetime.utcnow()
@@ -205,51 +218,75 @@ async def weather_monitor():
         posted_alerts[alert_id] = details["end"]
         zips_str = ", ".join(details["zips"])
         mentions_str = " ".join(details["mentions"])
-        if bot_channel:
-            await bot_channel.send(f"📍 ZIPs `{zips_str}` {mentions_str}\n{details['msg']}")
-
-# --- Quotes every 2 hours ---
-def get_quote():
-    try:
-        res = requests.get("https://type.fit/api/quotes")
-        if res.status_code == 200:
-            q = random.choice(res.json())
-            return f"{q['text']} — {q.get('author','Unknown')}"
-    except:
-        pass
-    return "Stay positive and keep going!"
+        target_channel = bot.get_channel(sandbox_channel_id) if sandbox_mode else bot_channel
+        if target_channel:
+            await target_channel.send(f"📍 ZIPs `{zips_str}` {mentions_str}\n{details['msg']}")
 
 @tasks.loop(minutes=120)
 async def send_quotes():
     now = datetime.now()
-    if 8 <= now.hour <= 20 and bot_channel:
-        await bot_channel.send(get_quote())
+    if 8 <= now.hour <= 20:
+        target_channel = bot.get_channel(sandbox_channel_id) if sandbox_mode else bot_channel
+        if target_channel:
+            await target_channel.send(get_quote())
 
-# --- Monday reminder ---
 @tasks.loop(hours=24)
 async def monday_reminder():
     now = datetime.now()
-    if now.weekday() == 0 and bot_channel:
-        await bot_channel.send("📌 Reminder: Inventory is due by 12 PM today!")
+    if now.weekday() == 0:
+        target_channel = bot.get_channel(sandbox_channel_id) if sandbox_mode else bot_channel
+        if target_channel:
+            await target_channel.send("📌 Reminder: Inventory is due by 12 PM today!")
 
-# --- Bot ready ---
+# --- FastAPI Web Listener ---
+app = FastAPI()
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.post("/trigger-alert")
+async def trigger_alert(data: dict):
+    zip_code = data.get("zip")
+    code = data.get("event_code")
+    if zip_code and code:
+        event = EVENT_SHORTHAND.get(code.lower())
+        if event:
+            users = [uid for uid, info in user_zips.items() if info["zip"] == zip_code]
+            mentions = " ".join([f"<@{uid}>" for uid in users])
+            msg = f"Webhook Trigger:\n📍 ZIP `{zip_code}` {mentions}\n⚠️ **{event}**"
+            target_channel = bot.get_channel(sandbox_channel_id) if sandbox_mode else bot_channel
+            if target_channel:
+                await target_channel.send(msg)
+            return {"status": "alert sent"}
+    return {"status": "failed"}
+
+# --- Bot Ready ---
 @bot.event
 async def on_ready():
     global bot_channel
     bot_channel = bot.get_channel(CHANNEL_ID)
-    
-    if bot_channel is None:
-        print(f"❌ Could not find channel with ID {CHANNEL_ID}.")
-        print("Make sure:")
-        print("- The ID is correct (right-click channel → Copy ID, Developer Mode ON).")
-        print("- The bot is in the server where this channel exists.")
-        print("- The bot has permission to view and send messages in the channel.")
-    else:
-        print(f"✅ Found channel: {bot_channel.name} (ID: {CHANNEL_ID})")
-    
-    print(f"{bot.user.name} is online!")
-    send_quotes.start()
-    monday_reminder.start()
-    weather_monitor.start()
 
-bot.run(TOKEN)
+    if bot_channel:
+        print(f"✅ Found channel: {bot_channel.name}")
+    else:
+        print(f"❌ Could not find channel with ID {CHANNEL_ID}")
+
+    print(f"{bot.user.name} is online!")
+
+    # start tasks safely
+    if not send_quotes.is_running():
+        send_quotes.start()
+    if not monday_reminder.is_running():
+        monday_reminder.start()
+    if not weather_monitor.is_running():
+        weather_monitor.start()
+
+# --- Run Bot + FastAPI ---
+async def main():
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+    asyncio.create_task(server.serve())  # run FastAPI in background
+    await bot.start(TOKEN)
+
+asyncio.run(main())
