@@ -225,7 +225,7 @@ def get_quote():
 async def send_quotes():
     now = datetime.now()
     if 8 <= now.hour <= 20:
-        channel = bot.get_channel(sandbox_channel_id if sandbox_mode else CHANNEL_ID)
+        channel = bot.get_channel(CHANNEL_ID)
         await channel.send(get_quote())
 
 # --- Monday inventory reminder ---
@@ -233,7 +233,7 @@ async def send_quotes():
 async def monday_reminder():
     now = datetime.now()
     if now.weekday() == 0:
-        channel = bot.get_channel(sandbox_channel_id if sandbox_mode else CHANNEL_ID)
+        channel = bot.get_channel(CHANNEL_ID)
         await channel.send("📌 Reminder: Inventory is due by 12 PM today!")
 
 # --- Bot ready ---
