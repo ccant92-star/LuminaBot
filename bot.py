@@ -7,74 +7,69 @@ from timezonefinder import TimezoneFinder
 import random
 import os
 import json
-from asyncio import sleep
+import feedparser
 
-# ---------------- CONFIG ----------------
 TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))       # General bot posts
-SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID"))  # Sales leaderboard channel
-CENTRAL = ZoneInfo("America/Chicago")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-if not TOKEN or not CHANNEL_ID or not SALES_CHANNEL_ID:
-    raise ValueError("TOKEN, CHANNEL_ID, and SALES_CHANNEL_ID must be set in env")
+if not TOKEN or not CHANNEL_ID:
+    raise ValueError("TOKEN and CHANNEL_ID must be set in env")
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
+intents.members = True  # Required for welcome messages
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------------- GLOBALS ----------------
+# --- Globals ---
 user_zips = {}            # user_id: {zip, lat, lon}
-rep_sales = {}            # user_id: {"count": int, "emoji": str}
-weekly_sales = {}         # user_id: cumulative weekly
 posted_alerts = {}        # alert_id: end_datetime
+daily_sales = {}          # user_id: sales count
+weekly_sales = {}         # user_id: sales count
+user_emoji = {}           # user_id: emoji
 sandbox_mode = False
 sandbox_channel_id = None
-quiet_mode = False
-quiet_until = None
+quiet_until = None        # datetime until bot is quiet
 tf = TimezoneFinder()
+NOAA_RSS_URL = "https://alerts.weather.gov/cap/us.php?x=1"
 
-ZIP_FILE = "user_zips.json"
-SALES_FILE = "rep_sales.json"
-WEEKLY_FILE = "weekly_sales.json"
+DATA_FILE = "lumina_data.json"
 
-# ---------------- UTILITIES ----------------
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f)
+# --- Load persisted data ---
+if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "r") as f:
+        data = json.load(f)
+        user_zips = data.get("user_zips", {})
+        daily_sales = data.get("daily_sales", {})
+        weekly_sales = data.get("weekly_sales", {})
+        user_emoji = data.get("user_emoji", {})
 
-def load_json(file):
-    try:
-        with open(file, "r") as f:
-            return json.load(f)
-    except:
-        return {}
+# --- Save data ---
+def save_data():
+    with open(DATA_FILE, "w") as f:
+        json.dump({
+            "user_zips": user_zips,
+            "daily_sales": daily_sales,
+            "weekly_sales": weekly_sales,
+            "user_emoji": user_emoji
+        }, f)
 
-user_zips = load_json(ZIP_FILE)
-rep_sales = load_json(SALES_FILE)
-weekly_sales = load_json(WEEKLY_FILE)
-
-async def send_message(channel, msg):
-    if quiet_mode:
-        return
-    await channel.send(msg)
-
-# ---------------- SAFETY ADVICE ----------------
+# --- Safety advice ---
 SAFETY_ADVICE = {
-    "Tornado Warning": "🌪️ Take shelter immediately in a basement or interior room on the lowest floor.",
-    "Severe Thunderstorm Warning": "⛈️ Stay indoors, avoid windows, unplug electronics.",
-    "Flash Flood Warning": "🌊 Move to higher ground immediately.",
-    "Heat Advisory": "🥵 Stay hydrated, avoid strenuous activity.",
-    "Winter Storm Warning": "❄️ Stay off roads if possible, keep warm.",
-    "High Wind Warning": "💨 Secure loose objects outdoors.",
-    "Excessive Heat Warning": "🔥 Stay indoors in AC if possible.",
-    "Hurricane Warning": "🌀 Follow evacuation orders.",
-    "Tropical Storm Warning": "🌧️ Prepare for flooding and strong winds.",
-    "Wildfire Warning": "🔥 Be ready to evacuate if ordered.",
-    "Dense Fog Advisory": "🌫️ Use low beams, drive slowly.",
-    "Blizzard Warning": "❄️ Avoid travel, stay indoors, ensure supplies."
+    "Tornado Warning": "🌪️ Take shelter immediately in a basement or interior room on the lowest floor, away from windows.",
+    "Severe Thunderstorm Warning": "⛈️ Stay indoors, avoid windows, and unplug electronics. Do not drive through flooded roads.",
+    "Flash Flood Warning": "🌊 Move to higher ground immediately. Never drive into floodwaters.",
+    "Heat Advisory": "🥵 Stay hydrated, avoid strenuous activity, and check on vulnerable people.",
+    "Winter Storm Warning": "❄️ Stay off roads if possible, keep warm, and have supplies in case of power outage.",
+    "High Wind Warning": "💨 Secure loose objects outdoors, avoid driving high-profile vehicles, and stay indoors.",
+    "Excessive Heat Warning": "🔥 Stay indoors in AC if possible, drink plenty of water, and avoid outdoor activity.",
+    "Hurricane Warning": "🌀 Follow evacuation orders. Move to higher ground, stay indoors away from windows.",
+    "Tropical Storm Warning": "🌧️ Prepare for flooding and strong winds. Stay indoors if possible.",
+    "Wildfire Warning": "🔥 Be ready to evacuate if ordered. Avoid breathing smoke and keep N95 masks if available.",
+    "Dense Fog Advisory": "🌫️ If driving, use low beams, slow down, and allow extra distance.",
+    "Blizzard Warning": "❄️ Avoid travel, stay indoors, and ensure you have food, water, and heat sources.",
 }
 
+# --- Event shorthand ---
 EVENT_SHORTHAND = {
     "tornado": "Tornado Warning",
     "twatch": "Tornado Watch",
@@ -93,21 +88,18 @@ EVENT_SHORTHAND = {
     "blizzard": "Blizzard Warning"
 }
 
-# ---------------- ZIP TO COORDS ----------------
+# --- Zippopotam ZIP → lat/lon ---
 def zip_to_coords(zip_code):
     try:
-        url = f"http://api.zippopotam.us/us/{zip_code}"
-        res = requests.get(url)
+        res = requests.get(f"http://api.zippopotam.us/us/{zip_code}")
         if res.status_code == 200:
             data = res.json()
-            lat = float(data["places"][0]["latitude"])
-            lon = float(data["places"][0]["longitude"])
-            return lat, lon
+            return float(data["places"][0]["latitude"]), float(data["places"][0]["longitude"])
     except:
         return None
     return None
 
-# ---------------- UTC → LOCAL ----------------
+# --- UTC → local ---
 def to_local_time(utc_str, lat, lon):
     try:
         if not utc_str:
@@ -121,103 +113,55 @@ def to_local_time(utc_str, lat, lon):
         return utc_str
     return utc_str
 
-# ---------------- WEATHER ALERTS ----------------
-def check_weather_alert(lat, lon):
-    url = f"https://api.weather.gov/alerts/active?point={lat},{lon}"
-    res = requests.get(url, headers={"User-Agent": "LuminaBot"})
-    new_alerts = []
-    if res.status_code == 200:
-        data = res.json()
-        alerts = data.get("features", [])
-        now = datetime.utcnow()
-        for alert in alerts:
-            alert_id = alert["id"]
-            props = alert["properties"]
-            try:
-                end_time = datetime.fromisoformat(props["ends"].replace("Z", "+00:00"))
-            except:
-                end_time = now + timedelta(hours=1)
-            if alert_id not in posted_alerts or posted_alerts[alert_id] < now:
-                event = props["event"]
-                advice = SAFETY_ADVICE.get(event, "⚠️ Stay alert and follow local guidance.")
-                start_local = to_local_time(props["effective"], lat, lon)
-                end_local = to_local_time(props["ends"], lat, lon)
-                new_alerts.append(
-                    (alert_id,
-                     f"⚠️ **{event}**\n{props['headline']}\n⏰ {start_local} → {end_local}\n\n👉 **Safety Advice:** {advice}",
-                     end_time)
-                )
-    return new_alerts
-
-# ---------------- COMMANDS ----------------
+# --- Weather command ---
 @bot.command()
 async def weather(ctx, zip_code: str = None):
-    user_id = str(ctx.author.id)
-    if zip_code is None:
-        if user_id in user_zips:
-            zip_code = user_zips[user_id]["zip"]
+    uid = str(ctx.author.id)
+    coords = None
+    if zip_code:
+        coords = zip_to_coords(zip_code)
+        if coords:
+            user_zips[uid] = {"zip": zip_code, "lat": coords[0], "lon": coords[1]}
+            save_data()
+            await ctx.send(f"✅ {ctx.author.mention}, ZIP {zip_code} registered.")
         else:
-            await ctx.send("❌ Please provide a ZIP code first, e.g., `!weather 12345`")
+            await ctx.send("❌ Invalid ZIP code.")
             return
-    coords = zip_to_coords(zip_code)
-    if coords:
-        lat, lon = coords
-        user_zips[user_id] = {"zip": zip_code, "lat": lat, "lon": lon}
-        save_json(ZIP_FILE, user_zips)
-        alerts = check_weather_alert(lat, lon)
-        msg = f"✅ {ctx.author.mention}, current alerts for ZIP {zip_code}:\n"
-        if alerts:
-            for _, alert_msg, _ in alerts:
-                if sandbox_mode:
-                    alert_msg = "[SANDBOX MODE] " + alert_msg
-                msg += alert_msg + "\n"
-        else:
-            msg += "No active alerts."
-        await ctx.send(msg)
+    elif uid in user_zips:
+        zip_code = user_zips[uid]["zip"]
+        coords = user_zips[uid]["lat"], user_zips[uid]["lon"]
     else:
-        await ctx.send("❌ Could not find that ZIP code.")
-
-@bot.command()
-async def repsale(ctx):
-    user_id = str(ctx.author.id)
-    if user_id not in rep_sales:
-        rep_sales[user_id] = {"count": 0, "emoji": "🛒"}
-        save_json(SALES_FILE, rep_sales)
-    await post_daily_leaderboard()
-
-@bot.command()
-async def setemoji(ctx, emoji: str):
-    user_id = str(ctx.author.id)
-    if user_id not in rep_sales:
-        rep_sales[user_id] = {"count": 0, "emoji": emoji}
-    else:
-        rep_sales[user_id]["emoji"] = emoji
-    save_json(SALES_FILE, rep_sales)
-    await ctx.send(f"✅ {ctx.author.mention}, your sales emoji is now {emoji}")
-
-@bot.command()
-@commands.has_permissions(manage_guild=True)
-async def quiet(ctx, minutes: int = 30):
-    global quiet_mode, quiet_until
-    quiet_mode = True
-    quiet_until = datetime.now(CENTRAL) + timedelta(minutes=minutes)
-    await ctx.send(f"🤫 Lumina will be quiet for {minutes} minutes.")
-    await sleep(minutes * 60)
-    quiet_mode = False
-    quiet_until = None
-    await ctx.send("✅ Quiet period over. Lumina is active again.")
-
-@bot.command()
-@commands.has_permissions(manage_guild=True)
-async def sandbox(ctx, code: int = None):
-    global sandbox_mode, sandbox_channel_id
-    if code != 8647:
-        await ctx.send("❌ Invalid sandbox code.")
+        await ctx.send("❌ No ZIP code registered. Use `!weather [ZIP]` to register.")
         return
-    sandbox_mode = not sandbox_mode
-    sandbox_channel_id = ctx.channel.id if sandbox_mode else None
-    await ctx.send(f"🧪 Sandbox mode {'enabled' if sandbox_mode else 'disabled'}.")
 
+    # Show current alerts for ZIP
+    alerts = []
+    feed = feedparser.parse(NOAA_RSS_URL)
+    for entry in feed.entries:
+        # Basic check if alert affects the user's location (simplified)
+        alerts.append(f"⚠️ {entry.title}: {entry.summary}")
+    if alerts:
+        await ctx.send("\n".join(alerts[:5]))  # limit to 5 alerts
+    else:
+        await ctx.send("✅ No active alerts for your area.")
+
+# --- Sandbox toggle ---
+@bot.command()
+@commands.has_permissions(manage_guild=True)
+async def sandbox(ctx, code: int):
+    global sandbox_mode, sandbox_channel_id
+    if code == 8647:
+        sandbox_mode = not sandbox_mode
+        if sandbox_mode:
+            sandbox_channel_id = ctx.channel.id
+            await ctx.send("🧪 Sandbox mode **enabled**. All messages will only appear here.")
+        else:
+            sandbox_channel_id = None
+            await ctx.send("✅ Sandbox mode **disabled**. Normal operation resumed.")
+    else:
+        await ctx.send("❌ Invalid sandbox code.")
+
+# --- Sandbox alert ---
 @bot.command()
 async def alert(ctx, code: str = None, zip_code: str = None):
     if not sandbox_mode:
@@ -235,117 +179,66 @@ async def alert(ctx, code: str = None, zip_code: str = None):
         await ctx.send(f"❌ No users registered for ZIP `{zip_code}`.")
         return
     mentions = " ".join([f"<@{uid}>" for uid in users])
-    start_local = datetime.now().strftime("%Y-%m-%d %I:%M %p %Z")
-    end_local = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %I:%M %p %Z")
+    now_str = datetime.now().strftime("%Y-%m-%d %I:%M %p %Z")
     advice = SAFETY_ADVICE.get(event, "⚠️ Stay alert and follow local guidance.")
-    msg = f"[SANDBOX MODE]\n📍 ZIP `{zip_code}` {mentions}\n⚠️ **{event}**\n⏰ {start_local} → {end_local}\n\n👉 **Safety Advice:** {advice}"
-    channel = bot.get_channel(sandbox_channel_id if sandbox_mode else CHANNEL_ID)
-    await send_message(channel, msg)
+    msg = f"📍 ZIP `{zip_code}` {mentions}\n⚠️ **{event}**\n⏰ {now_str}\n\n👉 **Safety Advice:** {advice} [SANDBOX MODE]"
+    channel = bot.get_channel(sandbox_channel_id)
+    await channel.send(msg)
+
+# --- Repsale commands ---
+@bot.command()
+async def repsale(ctx):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    channel = bot.get_channel(CHANNEL_ID)
+    if not daily_sales:
+        await ctx.send("No sales reported today.")
+        return
+    sorted_sales = sorted(daily_sales.items(), key=lambda x: x[1], reverse=True)
+    msg = f"📊 Daily Sales Leaderboard ({today_str}):\n"
+    for i, (uid, count) in enumerate(sorted_sales, 1):
+        emoji = user_emoji.get(uid, "🛒")
+        member = ctx.guild.get_member(int(uid))
+        name = member.display_name if member else uid
+        msg += f"{i}. {name} {emoji * count}\n"
+    await channel.send(msg)
+
+@bot.command()
+async def setemoji(ctx, emoji: str):
+    user_emoji[str(ctx.author.id)] = emoji
+    save_data()
+    await ctx.send(f"✅ {ctx.author.mention}, your sales emoji is now {emoji}")
 
 @bot.command()
 @commands.has_permissions(manage_guild=True)
-async def resetleaderboard(ctx, scope: str = "daily"):
-    global rep_sales, weekly_sales
+async def resetleaderboard(ctx, scope: str):
+    global daily_sales, weekly_sales
     if scope.lower() == "daily":
-        for uid in rep_sales:
-            rep_sales[uid]["count"] = 0
-        save_json(SALES_FILE, rep_sales)
-        await ctx.send("✅ Daily leaderboard reset.")
+        daily_sales = {}
     elif scope.lower() == "weekly":
-        for uid in weekly_sales:
-            weekly_sales[uid] = 0
-        save_json(WEEKLY_FILE, weekly_sales)
-        await ctx.send("✅ Weekly leaderboard reset.")
+        weekly_sales = {}
     else:
-        await ctx.send("❌ Invalid scope. Use `daily` or `weekly`.")
+        await ctx.send("Usage: `!resetleaderboard [daily|weekly]`")
+        return
+    save_data()
+    await ctx.send(f"✅ {scope.capitalize()} leaderboard reset.")
 
 @bot.command()
 async def weeklyleaderboard(ctx):
-    if not weekly_sales:
-        await ctx.send("📊 Weekly leaderboard: no sales yet this week.")
-        return
-    sorted_sales = sorted(weekly_sales.items(), key=lambda x: x[1], reverse=True)
-    lines = []
-    for i, (user_id, count) in enumerate(sorted_sales, start=1):
-        member = ctx.guild.get_member(int(user_id))
-        if member:
-            emoji = rep_sales.get(user_id, {}).get("emoji", "🛒")
-            lines.append(f"{i}. {member.mention} {emoji} ({count})")
-    now = datetime.now(CENTRAL)
-    start_of_week = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
-    today_str = now.strftime("%Y-%m-%d")
-    msg = f"📊 **Weekly Sales Leaderboard — {start_of_week} → {today_str}**\n" + "\n".join(lines)
-    channel = bot.get_channel(SALES_CHANNEL_ID)
-    await send_message(channel, msg)
-
-# ---------------- TASKS ----------------
-@tasks.loop(minutes=60)
-async def weather_monitor():
-    now = datetime.utcnow()
-    expired = [aid for aid, end in posted_alerts.items() if end < now]
-    for aid in expired:
-        del posted_alerts[aid]
-
+    today_str = datetime.now().strftime("%Y-%m-%d")
     channel = bot.get_channel(CHANNEL_ID)
-    zip_groups = {}
-    for user_id, info in user_zips.items():
-        if info["zip"] not in zip_groups:
-            zip_groups[info["zip"]] = {"lat": info["lat"], "lon": info["lon"], "users": []}
-        zip_groups[info["zip"]]["users"].append(user_id)
-
-    for zip_code, data in zip_groups.items():
-        new_alerts = check_weather_alert(data["lat"], data["lon"])
-        for alert_id, msg, end_time in new_alerts:
-            if alert_id not in posted_alerts:
-                posted_alerts[alert_id] = end_time
-                mentions = " ".join([f"<@{uid}>" for uid in data["users"]])
-                msg = f"[SANDBOX MODE] {msg}" if sandbox_mode else msg
-                await send_message(channel, f"📍 ZIP `{zip_code}` {mentions}\n{msg}")
-
-@tasks.loop(hours=24)
-async def daily_reset():
-    now = datetime.now(CENTRAL)
-    if now.hour == 8:
-        for uid in rep_sales:
-            rep_sales[uid]["count"] = 0
-        save_json(SALES_FILE, rep_sales)
-        await post_daily_leaderboard()
-        await post_weekly_leaderboard()
-    if now.hour == 23:
-        await post_daily_leaderboard()
-
-async def post_daily_leaderboard():
-    if not rep_sales or quiet_mode:
-        return
-    sorted_sales = sorted(rep_sales.items(), key=lambda x: x[1]["count"], reverse=True)
-    lines = []
-    for i, (user_id, info) in enumerate(sorted_sales, start=1):
-        member = bot.get_guild(bot.get_channel(SALES_CHANNEL_ID).guild.id).get_member(int(user_id))
-        if member:
-            lines.append(f"{i}. {member.mention} {info['emoji']} ({info['count']})")
-    now_str = datetime.now(CENTRAL).strftime("%Y-%m-%d")
-    msg = f"📊 **Daily Sales Leaderboard — {now_str}**\n" + "\n".join(lines)
-    channel = bot.get_channel(SALES_CHANNEL_ID)
-    await send_message(channel, msg)
-
-async def post_weekly_leaderboard():
-    if not weekly_sales or quiet_mode:
+    if not weekly_sales:
+        await ctx.send("No sales reported this week.")
         return
     sorted_sales = sorted(weekly_sales.items(), key=lambda x: x[1], reverse=True)
-    lines = []
-    now = datetime.now(CENTRAL)
-    start_of_week = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
-    today_str = now.strftime("%Y-%m-%d")
-    for i, (user_id, count) in enumerate(sorted_sales, start=1):
-        member = bot.get_guild(bot.get_channel(SALES_CHANNEL_ID).guild.id).get_member(int(user_id))
-        if member:
-            emoji = rep_sales.get(user_id, {}).get("emoji", "🛒")
-            lines.append(f"{i}. {member.mention} {emoji} ({count})")
-    msg = f"📊 **Weekly Sales Leaderboard — {start_of_week} → {today_str}**\n" + "\n".join(lines)
-    channel = bot.get_channel(SALES_CHANNEL_ID)
-    await send_message(channel, msg)
+    msg = f"📊 Weekly Sales Leaderboard ({today_str}):\n"
+    for i, (uid, count) in enumerate(sorted_sales, 1):
+        emoji = user_emoji.get(uid, "🛒")
+        member = ctx.guild.get_member(int(uid))
+        name = member.display_name if member else uid
+        msg += f"{i}. {name} {emoji * count}\n"
+    await channel.send(msg)
 
-# ---------------- QUOTES ----------------
+# --- Inspirational quotes ---
 def get_quote():
     try:
         res = requests.get("https://zenquotes.io/api/random")
@@ -358,29 +251,109 @@ def get_quote():
 
 @tasks.loop(minutes=120)
 async def send_quotes():
-    now = datetime.now(CENTRAL)
-    if 8 <= now.hour <= 20 and not quiet_mode:
+    now = datetime.now()
+    if 8 <= now.hour <= 20:
+        if quiet_until and datetime.now() < quiet_until:
+            return
         channel = bot.get_channel(CHANNEL_ID)
-        await send_message(channel, get_quote())
+        await channel.send(get_quote())
 
-# ---------------- WELCOME ----------------
+# --- Quiet mode ---
+@bot.command()
+@commands.has_permissions(manage_guild=True)
+async def quiet(ctx, minutes: int = 30):
+    global quiet_until
+    quiet_until = datetime.now() + timedelta(minutes=minutes)
+    await ctx.send(f"🤫 Bot will be quiet for {minutes} minutes.")
+
+# --- Weather monitor (RSS) ---
+@tasks.loop(minutes=2)
+async def weather_monitor():
+    now = datetime.utcnow()
+    expired = [aid for aid, end in posted_alerts.items() if end < now]
+    for aid in expired:
+        del posted_alerts[aid]
+
+    if quiet_until and datetime.now() < quiet_until:
+        return
+
+    channel = bot.get_channel(sandbox_channel_id if sandbox_mode else CHANNEL_ID)
+
+    feed = feedparser.parse(NOAA_RSS_URL)
+    zip_groups = {}
+    for uid, info in user_zips.items():
+        if info["zip"] not in zip_groups:
+            zip_groups[info["zip"]] = {"lat": info["lat"], "lon": info["lon"], "users": []}
+        zip_groups[info["zip"]]["users"].append(uid)
+
+    for entry in feed.entries:
+        alert_id = entry.id
+        title = entry.title
+        summary = entry.summary
+        try:
+            end_time = datetime.strptime(entry.updated, "%Y-%m-%dT%H:%M:%S%z").astimezone(tz=None)
+        except:
+            end_time = now + timedelta(hours=1)
+
+        if alert_id not in posted_alerts or posted_alerts[alert_id] < now:
+            posted_alerts[alert_id] = end_time
+            advice = SAFETY_ADVICE.get(title, "⚠️ Stay alert and follow local guidance.")
+            sandbox_tag = " [SANDBOX MODE]" if sandbox_mode else ""
+            mentions_list = []
+            for zip_code, data in zip_groups.items():
+                mentions = " ".join([f"<@{uid}>" for uid in data["users"]])
+                mentions_list.append(f"📍 ZIP `{zip_code}` {mentions}")
+            mentions_str = "\n".join(mentions_list) if mentions_list else "No registered users."
+            await channel.send(f"⚠️ **{title}**{sandbox_tag}\n{summary}\n\n👉 **Safety Advice:** {advice}\n\n{mentions_str}")
+
+# --- Monday EOD reminders ---
+@tasks.loop(hours=24)
+async def monday_reminder():
+    now = datetime.now()
+    if now.weekday() == 0 and (not quiet_until or datetime.now() > quiet_until):
+        channel = bot.get_channel(CHANNEL_ID)
+        await channel.send("📌 Reminder: Inventory is due by 12 PM today!")
+
+# --- Daily leaderboard reset at 8 AM Central ---
+@tasks.loop(minutes=60)
+async def daily_reset():
+    now = datetime.now(ZoneInfo("America/Chicago"))
+    if now.hour == 8 and now.minute < 60:
+        global daily_sales
+        daily_sales = {}
+        save_data()
+        channel = bot.get_channel(CHANNEL_ID)
+        await channel.send("🔄 Daily sales leaderboard reset.")
+
+# --- Weekly leaderboard reset every Sunday 8 AM Central ---
+@tasks.loop(minutes=60)
+async def weekly_reset():
+    now = datetime.now(ZoneInfo("America/Chicago"))
+    if now.weekday() == 6 and now.hour == 8:
+        global weekly_sales
+        weekly_sales = {}
+        save_data()
+        channel = bot.get_channel(CHANNEL_ID)
+        await channel.send("🔄 Weekly sales leaderboard reset.")
+
+# --- Welcome new members ---
 @bot.event
 async def on_member_join(member):
-    channel = bot.get_channel(CHANNEL_ID)
-    await send_message(channel, f"👋 Welcome {member.mention} to the server!")
+    channel = member.guild.system_channel
+    if channel:
+        await channel.send(f"👋 Welcome {member.mention}!")
 
-# ---------------- BOT READY ----------------
+# --- Bot ready ---
 @bot.event
 async def on_ready():
     print(f"{bot.user.name} is online!")
-    
-    # Send "I'm Here!" message
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
         await channel.send("👋 I'm Here!")
-
-    daily_reset.start()
     send_quotes.start()
     weather_monitor.start()
+    monday_reminder.start()
+    daily_reset.start()
+    weekly_reset.start()
 
 bot.run(TOKEN)
