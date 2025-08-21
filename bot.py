@@ -8,7 +8,10 @@ import random
 import os
 
 TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+CHANNEL_ID = os.getenv(CHANNEL_ID)
+
+if not TOKEN or not CHANNEL_ID:
+    raise ValueError("TOKEN and CHANNEL_ID must be set in env")
 
 intents = discord.Intents.default()
 intents.message_content = True
