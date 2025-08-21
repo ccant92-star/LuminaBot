@@ -13,9 +13,10 @@ import uvicorn
 # --- Environment Variables ---
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))  # main Discord channel
+SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID"))  # #sales-reporting
 
-if not TOKEN or not CHANNEL_ID:
-    raise ValueError("TOKEN and CHANNEL_ID must be set in env")
+if not TOKEN or not CHANNEL_ID or not SALES_CHANNEL_ID:
+    raise ValueError("TOKEN, CHANNEL_ID, and SALES_CHANNEL_ID must be set in env")
 
 # --- Bot Setup ---
 intents = discord.Intents.default()
@@ -29,6 +30,9 @@ sandbox_mode = False
 sandbox_channel_id = None
 tf = TimezoneFinder()
 bot_channel = None      # main channel object
+
+rep_sales = {}          # user_id: number of sales
+rep_emojis = {}         # user_id: emoji
 
 # --- Safety Advice ---
 SAFETY_ADVICE = {
@@ -44,7 +48,6 @@ SAFETY_ADVICE = {
     "Wildfire Warning": "🔥 Be ready to evacuate if ordered. Avoid breathing smoke and keep N95 masks if available.",
     "Dense Fog Advisory": "🌫️ If driving, use low beams, slow down, and allow extra distance.",
     "Blizzard Warning": "❄️ Avoid travel, stay indoors, and ensure you have food, water, and heat sources.",
-    # Watches
     "Tornado Watch": "🌪️ Be alert! Conditions are favorable for tornadoes. Stay tuned to local weather updates.",
     "Severe Thunderstorm Watch": "⛈️ Conditions are favorable for severe thunderstorms. Monitor forecasts and be ready to take shelter.",
     "Flash Flood Watch": "🌊 Conditions are favorable for flash flooding. Stay alert and plan how to reach higher ground if needed."
@@ -71,13 +74,15 @@ EVENT_SHORTHAND = {
 
 # --- Helper Functions ---
 def zip_to_coords(zip_code):
+    """Converts a US ZIP code into (latitude, longitude) using Zippopotam.us API."""
     try:
-        url = f"https://nominatim.openstreetmap.org/search?postalcode={zip_code}&country=US&format=json"
-        res = requests.get(url, headers={"User-Agent": "LuminaBot"})
-        data = res.json()
-        if data:
-            return float(data[0]["lat"]), float(data[0]["lon"])
-    except:
+        res = requests.get(f"http://api.zippopotam.us/us/{zip_code}", timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            place = data['places'][0]
+            return float(place['latitude']), float(place['longitude'])
+    except Exception as e:
+        print(f"Error fetching coordinates for ZIP {zip_code}: {e}")
         return None
     return None
 
@@ -191,7 +196,52 @@ async def alert(ctx, code: str = None, zip_code: str = None):
     if target_channel:
         await target_channel.send(msg)
 
+# --- Sales Commands ---
+@bot.command()
+async def setemoji(ctx, emoji: str):
+    """Set your personal emoji to represent a sale."""
+    rep_emojis[ctx.author.id] = emoji
+    await ctx.send(f"✅ {ctx.author.mention}, your sale emoji is now {emoji}")
+
+@bot.command()
+async def addsale(ctx, count: int = 1):
+    """Add one or more sales to your total."""
+    rep_sales[ctx.author.id] = rep_sales.get(ctx.author.id, 0) + count
+    await ctx.send(f"✅ {ctx.author.mention}, you now have {rep_sales[ctx.author.id]} sale(s).")
+
+@bot.command()
+async def repsale(ctx):
+    """Post the current sales leaderboard in #sales-reporting automatically with current date."""
+    if not rep_sales:
+        await ctx.send("No sales recorded yet.")
+        return
+
+    sorted_reps = sorted(rep_sales.items(), key=lambda x: x[1], reverse=True)
+    lines = []
+    for i, (user_id, count) in enumerate(sorted_reps, start=1):
+        user = await bot.fetch_user(user_id)
+        emoji = rep_emojis.get(user_id, "🛒")
+        lines.append(f"{i}. {user.mention} {' '.join([emoji]*count)}")
+
+    leaderboard = "\n".join(lines)
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    sales_channel = bot.get_channel(SALES_CHANNEL_ID)
+    if sales_channel:
+        await sales_channel.send(f"📊 **Sales Leaderboard — {current_date}**\n{leaderboard}")
+        await ctx.send(f"✅ Sales leaderboard posted in {sales_channel.mention}")
+    else:
+        await ctx.send("❌ Could not find the sales channel.")
+
 # --- Discord Tasks ---
+@tasks.loop(hours=2)
+async def send_quotes():
+    """Post an inspirational quote every 2 hours between 8 AM and 8 PM."""
+    now = datetime.now()
+    if 8 <= now.hour <= 20:
+        target_channel = bot.get_channel(sandbox_channel_id) if sandbox_mode else bot_channel
+        if target_channel:
+            await target_channel.send(get_quote())
+
 @tasks.loop(minutes=60)
 async def weather_monitor():
     now = datetime.utcnow()
@@ -221,14 +271,6 @@ async def weather_monitor():
         target_channel = bot.get_channel(sandbox_channel_id) if sandbox_mode else bot_channel
         if target_channel:
             await target_channel.send(f"📍 ZIPs `{zips_str}` {mentions_str}\n{details['msg']}")
-
-@tasks.loop(minutes=120)
-async def send_quotes():
-    now = datetime.now()
-    if 8 <= now.hour <= 20:
-        target_channel = bot.get_channel(sandbox_channel_id) if sandbox_mode else bot_channel
-        if target_channel:
-            await target_channel.send(get_quote())
 
 @tasks.loop(hours=24)
 async def monday_reminder():
@@ -274,7 +316,7 @@ async def on_ready():
 
     print(f"{bot.user.name} is online!")
 
-    # start tasks safely
+    # Start tasks safely
     if not send_quotes.is_running():
         send_quotes.start()
     if not monday_reminder.is_running():
@@ -286,7 +328,7 @@ async def on_ready():
 async def main():
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
     server = uvicorn.Server(config)
-    asyncio.create_task(server.serve())  # run FastAPI in background
+    asyncio.create_task(server.serve())
     await bot.start(TOKEN)
 
 asyncio.run(main())
