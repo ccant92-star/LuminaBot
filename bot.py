@@ -23,10 +23,10 @@ posted_alerts = {}        # alert_id: end_datetime
 sandbox_mode = False
 sandbox_channel_id = None
 tf = TimezoneFinder()
+bot_channel = None        # main channel object
 
 # --- Safety advice ---
 SAFETY_ADVICE = {
-    # Warnings
     "Tornado Warning": "🌪️ Take shelter immediately in a basement or interior room on the lowest floor, away from windows.",
     "Severe Thunderstorm Warning": "⛈️ Stay indoors, avoid windows, and unplug electronics. Do not drive through flooded roads.",
     "Flash Flood Warning": "🌊 Move to higher ground immediately. Never drive into floodwaters.",
@@ -46,7 +46,7 @@ SAFETY_ADVICE = {
     "Flash Flood Watch": "🌊 Conditions are favorable for flash flooding. Stay alert and plan how to reach higher ground if needed."
 }
 
-# --- Shorthand mapping ---
+# --- Event shorthand ---
 EVENT_SHORTHAND = {
     "tornado": "Tornado Warning",
     "twatch": "Tornado Watch",
@@ -103,12 +103,10 @@ def check_weather_alert(lat, lon):
         for alert in alerts:
             alert_id = alert["id"]
             props = alert["properties"]
-            # parse end time
             try:
                 end_time = datetime.fromisoformat(props["ends"].replace("Z", "+00:00"))
             except:
                 end_time = now + timedelta(hours=1)
-            # only post if not active in posted_alerts
             if alert_id not in posted_alerts or posted_alerts[alert_id] < now:
                 event = props["event"]
                 advice = SAFETY_ADVICE.get(event, "⚠️ Stay alert and follow local emergency guidance.")
@@ -176,24 +174,23 @@ async def alert(ctx, code: str = None, zip_code: str = None):
         f"⏰ {start_local} → {end_local}\n\n"
         f"👉 **Safety Advice:** {advice}"
     )
-    channel = bot.get_channel(sandbox_channel_id if sandbox_mode else CHANNEL_ID)
-    await channel.send(msg)
+    target_channel = bot.get_channel(sandbox_channel_id) if sandbox_mode else bot_channel
+    if target_channel:
+        await target_channel.send(msg)
 
 # --- Monitor alerts every hour ---
 @tasks.loop(minutes=60)
 async def weather_monitor():
-    # Cleanup expired alerts
     now = datetime.utcnow()
+    # Cleanup expired alerts
     expired = [aid for aid, end in posted_alerts.items() if end < now]
     for aid in expired:
         del posted_alerts[aid]
 
-    channel = bot.get_channel(sandbox_channel_id if sandbox_mode else CHANNEL_ID)
     zip_groups = {}
     for user_id, info in user_zips.items():
-        if info["zip"] not in zip_groups:
-            zip_groups[info["zip"]] = {"lat": info["lat"], "lon": info["lon"], "users": []}
-        zip_groups[info["zip"]]["users"].append(user_id)
+        zip_groups.setdefault(info["zip"], {"lat": info["lat"], "lon": info["lon"], "users": []})["users"].append(user_id)
+
     alert_map = {}
     for zip_code, data in zip_groups.items():
         new_alerts = check_weather_alert(data["lat"], data["lon"])
@@ -204,13 +201,15 @@ async def weather_monitor():
                     alert_map[alert_id] = {"msg": msg, "zips": [], "mentions": [], "end": end_time}
                 alert_map[alert_id]["zips"].append(zip_code)
                 alert_map[alert_id]["mentions"].append(mentions)
+
     for alert_id, details in alert_map.items():
         posted_alerts[alert_id] = details["end"]
         zips_str = ", ".join(details["zips"])
         mentions_str = " ".join(details["mentions"])
-        await channel.send(f"📍 ZIPs `{zips_str}` {mentions_str}\n{details['msg']}")
+        if bot_channel:
+            await bot_channel.send(f"📍 ZIPs `{zips_str}` {mentions_str}\n{details['msg']}")
 
-# --- Quotes every 2 hours 8AM-8PM ---
+# --- Quotes every 2 hours ---
 def get_quote():
     try:
         res = requests.get("https://type.fit/api/quotes")
@@ -224,21 +223,23 @@ def get_quote():
 @tasks.loop(minutes=120)
 async def send_quotes():
     now = datetime.now()
-    if 8 <= now.hour <= 20:
-        channel = bot.get_channel(CHANNEL_ID)
-        await channel.send(get_quote())
+    if 8 <= now.hour <= 20 and bot_channel:
+        await bot_channel.send(get_quote())
 
-# --- Monday inventory reminder ---
+# --- Monday reminder ---
 @tasks.loop(hours=24)
 async def monday_reminder():
     now = datetime.now()
-    if now.weekday() == 0:
-        channel = bot.get_channel(CHANNEL_ID)
-        await channel.send("📌 Reminder: Inventory is due by 12 PM today!")
+    if now.weekday() == 0 and bot_channel:
+        await bot_channel.send("📌 Reminder: Inventory is due by 12 PM today!")
 
 # --- Bot ready ---
 @bot.event
 async def on_ready():
+    global bot_channel
+    bot_channel = bot.get_channel(CHANNEL_ID)
+    if not bot_channel:
+        print(f"❌ Could not find channel ID {CHANNEL_ID}")
     print(f"{bot.user.name} is online!")
     send_quotes.start()
     monday_reminder.start()
