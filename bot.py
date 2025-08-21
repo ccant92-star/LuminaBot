@@ -182,7 +182,6 @@ async def alert(ctx, code: str = None, zip_code: str = None):
 @tasks.loop(minutes=60)
 async def weather_monitor():
     now = datetime.utcnow()
-    # Cleanup expired alerts
     expired = [aid for aid, end in posted_alerts.items() if end < now]
     for aid in expired:
         del posted_alerts[aid]
@@ -238,8 +237,16 @@ async def monday_reminder():
 async def on_ready():
     global bot_channel
     bot_channel = bot.get_channel(CHANNEL_ID)
-    if not bot_channel:
-        print(f"❌ Could not find channel ID {CHANNEL_ID}")
+    
+    if bot_channel is None:
+        print(f"❌ Could not find channel with ID {CHANNEL_ID}.")
+        print("Make sure:")
+        print("- The ID is correct (right-click channel → Copy ID, Developer Mode ON).")
+        print("- The bot is in the server where this channel exists.")
+        print("- The bot has permission to view and send messages in the channel.")
+    else:
+        print(f"✅ Found channel: {bot_channel.name} (ID: {CHANNEL_ID})")
+    
     print(f"{bot.user.name} is online!")
     send_quotes.start()
     monday_reminder.start()
