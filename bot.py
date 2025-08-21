@@ -6,8 +6,8 @@ from zoneinfo import ZoneInfo
 from timezonefinder import TimezoneFinder
 import random
 
-TOKEN = "YOUR_BOT_TOKEN"
-CHANNEL_ID = 123456789012345678  # Shared alert channel
+TOKEN = os.getenv("TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
