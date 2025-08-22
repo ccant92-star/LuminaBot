@@ -5,8 +5,8 @@ from flask import Flask
 from cogs import inventory, sales, weather, quotes, events
 
 # Load env variables
-from dotenv import load_dotenv
-load_dotenv("config.env")
+# from dotenv import load_dotenv
+# load_dotenv("config.env")
 
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
