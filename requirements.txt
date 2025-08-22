@@ -3,5 +3,5 @@ requests>=2.31.0
 Flask>=3.0.3
 python-dateutil>=2.6.0
 pillow>=10.0.1
-feedparser>=6.1.0
+feedparser>=6.0.10
 timezonefinder>=6.0.1
