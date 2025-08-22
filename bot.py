@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 import io
 import logging
 import feedparser
+import base64
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -177,43 +178,79 @@ async def submit_to_jotform(answers, signature_image):
 
 @bot.command()
 async def inventory(ctx):
-    dm = await ctx.author.create_dm()
-    await dm.send("Starting Inventory submission...")
-    questions = [
-        ("Do you have inventory? (YES/NO)", "inventory_status"),
-        ("What company? (GENMOBILE / Genmobile SIMS (count))", "company"),
-        ("Agent First Name", "first_name"),
-        ("Agent Last Name", "last_name"),
-        ("Agent Email", "email"),
-        ("Enter multiple IMEIs (comma separated)", "imeis"),
-        ("Any RMAs? If yes, list them", "rmas"),
-        ("Special notes for this submission", "notes")
-    ]
-    answers = {}
-    for q, key in questions:
-        await dm.send(q)
-        msg = await bot.wait_for("message", check=lambda m: m.author==ctx.author and m.channel==dm, timeout=300)
-        answers[key] = msg.content
+    if not isinstance(ctx.channel, discord.DMChannel):
+        await ctx.author.send("This command only works in DMs. I have sent you a DM.")
+    
+    user = ctx.author
+    await user.send("Starting inventory submission. Please answer the following questions:")
 
-    # Generate signature
-    sig_img = Image.new("RGB", (600,150), color="white")
-    d = ImageDraw.Draw(sig_img)
-    try:
-        font = ImageFont.truetype("arial.ttf", 40)
-    except:
-        font = ImageFont.load_default()
-    d.text((10,50), f"{answers['first_name']} {answers['last_name']}", fill="black", font=font)
+    # 1. Today's date
+    today = datetime.now().strftime("%m-%d-%Y")
+    await user.send(f"Today's date will be automatically set to {today}.")
+    
+    # 2. Do you have inventory?
+    await user.send("Do you have inventory? (YES/NO)")
+    msg = await bot.wait_for("message", check=lambda m: m.author == user)
+    do_inventory = msg.content.strip().upper()
 
-    bio_sig = io.BytesIO()
-    sig_img.save(bio_sig, format="PNG")
-    bio_sig.seek(0)
-    await dm.send("Generated signature:", file=discord.File(fp=bio_sig, filename="signature.png"))
+    # 3. Company
+    await user.send("What company? (GENMOBILE / Genmobile SIMS (count))")
+    msg = await bot.wait_for("message", check=lambda m: m.author == user)
+    company = msg.content.strip()
 
-    success = await submit_to_jotform(answers, sig_img)
-    if success:
-        await dm.send("✅ Inventory successfully submitted to JotForm!")
-    else:
-        await dm.send("❌ Failed to submit inventory. Please try again.")
+    # 4. Agent Name
+    await user.send("Please enter your first and last name (e.g., John Doe):")
+    msg = await bot.wait_for("message", check=lambda m: m.author == user)
+    names = msg.content.strip().split()
+    first_name = names[0]
+    last_name = " ".join(names[1:]) if len(names) > 1 else ""
+
+    # 5. Agent Email
+    await user.send("Enter your email:")
+    msg = await bot.wait_for("message", check=lambda m: m.author == user)
+    email = msg.content.strip()
+
+    # 6. IMEIs
+    await user.send("Enter all IMEIs for phones, one per line:")
+    msg = await bot.wait_for("message", check=lambda m: m.author == user)
+    imeis_list = [imei.strip() for imei in msg.content.splitlines() if imei.strip()]
+    imeis_text = "\n".join(imeis_list)
+
+    # 7. RMAs
+    await user.send("Any RMAs to report? (leave blank if none):")
+    msg = await bot.wait_for("message", check=lambda m: m.author == user)
+    rmas = msg.content.strip()
+
+    # 8. Special Notes
+    await user.send("Any special notes? (leave blank if none):")
+    msg = await bot.wait_for("message", check=lambda m: m.author == user)
+    notes = msg.content.strip()
+
+    # 9. Signature (generate simple image with name)
+    from PIL import Image, ImageDraw, ImageFont
+    signature_img = Image.new("RGB", (650, 114), color="white")
+    draw = ImageDraw.Draw(signature_img)
+    font = ImageFont.load_default()
+    draw.text((10, 50), f"{first_name} {last_name}", fill="black", font=font)
+    signature_img_path = f"{user.id}_signature.png"
+    signature_img.save(signature_img_path)
+
+    # Submit to JotForm
+    form_url = "https://submit.jotform.com/submit/231344559880059"
+    files = {"q11_signature": open(signature_img_path, "rb")}
+    data = {
+        "q3_todaysDate": today,
+        "q12_doYou": do_inventory,
+        "q6_whatCompany": company,
+        "q5_agentName[first]": first_name,
+        "q5_agentName[last]": last_name,
+        "q26_managerEmail": email,
+        "q24_imeisFor": imeis_text,
+        "q14_doYou14": rmas,
+        "q18_pleaseLeave18": notes
+    }
+    requests.post(form_url, data=data, files=files)
+    await user.send("✅ Inventory submitted successfully!")
 
 # --- Bot ready ---
 @bot.event
