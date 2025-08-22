@@ -16,10 +16,12 @@ import feedparser
 
 # --- Environment Variables ---
 TOKEN = os.getenv("TOKEN")
-SALES_CHANNEL_ID = int(os.getenv("SALES_CHANNEL_ID"))
+GENERAL_CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+OWNER_ID = int(os.getenv("OWNER_ID"))
+MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID"))
 
-if not TOKEN or not SALES_CHANNEL_ID:
-    raise ValueError("TOKEN and SALES_CHANNEL_ID must be set in env")
+if not TOKEN or not GENERAL_CHANNEL_ID or not OWNER_ID:
+    raise ValueError("TOKEN, CHANNEL_ID, and OWNER_ID must be set in env")
 
 # --- Discord Bot Setup ---
 intents = discord.Intents.default()
@@ -31,6 +33,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 user_zips = {}
 sales_data = {}
 posted_alerts = {}
+sandbox_mode = False
+sandbox_channel_id = None
 quiet_until = None
 tf = TimezoneFinder()
 DATA_FILE = "lumina_data.json"
@@ -49,28 +53,24 @@ def save_data():
     with open(DATA_FILE, "w") as f:
         json.dump({"user_zips": user_zips, "sales_data": sales_data}, f)
 
-# --- Safety Advice (including watches) ---
+# --- Safety Advice ---
 SAFETY_ADVICE = {
     "Tornado Warning": "🌪️ Take shelter immediately in a basement or interior room on the lowest floor, away from windows.",
-    "Tornado Watch": "🌪️ Conditions are favorable for tornadoes. Stay alert and be ready to take shelter.",
-    "Severe Thunderstorm Warning": "⛈️ Stay indoors, avoid windows, and unplug electronics. Do not drive through flooded roads.",
-    "Severe Thunderstorm Watch": "⛈️ Conditions are favorable for severe thunderstorms. Monitor weather updates.",
+    "Tornado Watch": "🌪️ Stay alert and monitor local news. Be ready to take shelter.",
+    "Severe Thunderstorm Warning": "⛈️ Stay indoors, avoid windows, and unplug electronics.",
+    "Severe Thunderstorm Watch": "⛈️ Be alert for severe storms. Secure loose objects outside.",
     "Flash Flood Warning": "🌊 Move to higher ground immediately. Never drive into floodwaters.",
-    "Flash Flood Watch": "🌊 Conditions are favorable for flash flooding. Stay alert and prepared to move to safety.",
+    "Flash Flood Watch": "🌊 Be alert for rising water. Prepare to move if needed.",
     "Heat Advisory": "🥵 Stay hydrated, avoid strenuous activity, and check on vulnerable people.",
-    "Winter Storm Warning": "❄️ Stay off roads if possible, keep warm, and have supplies in case of power outage.",
-    "High Wind Warning": "💨 Secure loose objects outdoors, avoid driving high-profile vehicles, and stay indoors.",
-    "Excessive Heat Warning": "🔥 Stay indoors in AC if possible, drink plenty of water, and avoid outdoor activity.",
-    "Hurricane Warning": "🌀 Follow evacuation orders. Move to higher ground, stay indoors away from windows.",
-    "Hurricane Watch": "🌀 Conditions are favorable for hurricane development. Monitor local authorities.",
+    "Winter Storm Warning": "❄️ Stay off roads, keep warm, and have supplies ready.",
+    "High Wind Warning": "💨 Secure loose objects, avoid driving high-profile vehicles, stay indoors.",
+    "Excessive Heat Warning": "🔥 Stay indoors in AC if possible, drink plenty of water.",
+    "Hurricane Warning": "🌀 Follow evacuation orders. Move to higher ground, stay indoors.",
     "Tropical Storm Warning": "🌧️ Prepare for flooding and strong winds. Stay indoors if possible.",
-    "Tropical Storm Watch": "🌧️ Conditions are favorable for tropical storm development. Monitor updates.",
-    "Wildfire Warning": "🔥 Be ready to evacuate if ordered. Avoid breathing smoke and keep N95 masks if available.",
-    "Dense Fog Advisory": "🌫️ If driving, use low beams, slow down, and allow extra distance.",
-    "Blizzard Warning": "❄️ Avoid travel, stay indoors, and ensure you have food, water, and heat sources.",
+    "Wildfire Warning": "🔥 Be ready to evacuate if ordered. Avoid breathing smoke.",
+    "Dense Fog Advisory": "🌫️ Drive slowly, use low beams, allow extra distance.",
+    "Blizzard Warning": "❄️ Avoid travel, stay indoors, have food, water, and heat sources.",
 }
-
-EVENT_SHORTHAND = {k.lower(): k for k in SAFETY_ADVICE.keys()}
 
 # --- ZIP → lat/lon using Zippopotam ---
 def zip_to_coords(zip_code):
@@ -116,32 +116,28 @@ async def weather(ctx, zip_code: str = None):
         if not info:
             await ctx.send("❌ No ZIP registered. Use `!weather [ZIP]` to register.")
             return
-        await ctx.send(f"✅ {ctx.author.mention}, no active alerts for ZIP {info['zip']}.")
+        # NOAA RSS alerts
+        rss_url = f"https://alerts.weather.gov/cap/us.php?x={info['zip']}"
+        feed = feedparser.parse(rss_url)
+        alerts = []
+        for entry in feed.entries:
+            title = entry.title
+            advice = SAFETY_ADVICE.get(title, "")
+            alerts.append(f"⚠️ {title}: {advice}")
+        if alerts:
+            await ctx.send("\n".join(alerts))
+        else:
+            await ctx.send(f"✅ {ctx.author.mention}, no active alerts for ZIP {info['zip']}.")
 
-# --- Weather check via NOAA RSS ---
-def fetch_noaa_alerts():
-    alerts = {}
-    for uid, info in user_zips.items():
-        lat, lon = info["lat"], info["lon"]
-        try:
-            rss_url = f"https://alerts.weather.gov/cap/us.php?x={lat},{lon}&y={lon}"
-            feed = feedparser.parse(rss_url)
-            alerts[uid] = []
-            for entry in feed.entries:
-                title = entry.title
-                summary = SAFETY_ADVICE.get(title, "")
-                alerts[uid].append({"title": title, "summary": summary})
-        except:
-            alerts[uid] = []
-    return alerts
-
-# --- Sales leaderboard ---
-ASSURANCE_EMOJI = "📶"
-GENMOBILE_EMOJI = "📱"
+# --- Sales leaderboard (static emojis) ---
+COMPANY_EMOJIS = {
+    "Assurance Wireless": "📱",
+    "GenMobile": "📶"
+}
 
 @bot.command()
 async def repsale(ctx):
-    channel = bot.get_channel(SALES_CHANNEL_ID)
+    channel = bot.get_channel(GENERAL_CHANNEL_ID)
     if not sales_data:
         await channel.send("❌ No sales reported today.")
         return
@@ -149,13 +145,24 @@ async def repsale(ctx):
     today = datetime.now().strftime("%Y-%m-%d")
     msg = f"📊 **Daily Sales Leaderboard – {today}**\n"
     for idx, (uid, data) in enumerate(sorted_sales, start=1):
-        company = data.get("company","GENMOBILE")
-        emoji = ASSURANCE_EMOJI if company=="Assurance Wireless" else GENMOBILE_EMOJI
+        company = data.get("company","GenMobile")
+        emoji = COMPANY_EMOJIS.get(company, "🛒")
         count = data.get("daily",0)
         msg += f"{idx}. <@{uid}> {emoji} x{count}\n"
     await channel.send(msg)
 
-# --- Inspirational quotes ---
+@bot.command()
+async def resetleaderboard(ctx):
+    if ctx.author.id != OWNER_ID:
+        await ctx.send("❌ You do not have permission to run this command.")
+        return
+    global sales_data
+    for uid in sales_data:
+        sales_data[uid]["daily"] = 0
+    save_data()
+    await ctx.send("✅ Sales leaderboard has been reset!")
+
+# --- Inspirational quotes (once per day) ---
 def get_quote():
     try:
         res = requests.get("https://zenquotes.io/api/random")
@@ -166,11 +173,11 @@ def get_quote():
         pass
     return "Stay positive and keep going!"
 
-@tasks.loop(hours=2)
-async def send_quotes():
+@tasks.loop(hours=24)
+async def send_quote_daily():
     now = datetime.now()
-    if 8 <= now.hour <= 20:
-        channel = bot.get_channel(SALES_CHANNEL_ID)
+    if now.hour == 8:
+        channel = bot.get_channel(GENERAL_CHANNEL_ID)
         await channel.send(get_quote())
 
 # --- Flask server to bind port ---
@@ -190,12 +197,12 @@ JOTFORM_URL = "https://submit.jotform.com/submit/231344559880059"
 
 QUESTIONS = [
     "Do you have inventory? (YES/NO)",
-    "Company? (GENMOBILE / Genmobile SIMS (count))",
+    "Company? (Assurance Wireless / GenMobile)",
     "First Name",
     "Last Name",
     "Agent Email",
-    "IMEIs for phones (textarea 1, line separated)",
-    "IMEIs for phones (textarea 2, line separated)",
+    "IMEIs for phones (textarea 1, line-separated)",
+    "IMEIs for phones (textarea 2, line-separated)",
     "RMAs (if any, optional)",
     "Special Notes (optional)"
 ]
@@ -243,12 +250,12 @@ async def inventory(ctx):
 
         payload = {
             FIELD_MAPPING["inventory"]: responses["Do you have inventory? (YES/NO)"],
-            FIELD_MAPPING["company"]: responses["Company? (GENMOBILE / Genmobile SIMS (count))"],
+            FIELD_MAPPING["company"]: responses["Company? (Assurance Wireless / GenMobile)"],
             FIELD_MAPPING["first_name"]: responses["First Name"],
             FIELD_MAPPING["last_name"]: responses["Last Name"],
             FIELD_MAPPING["email"]: responses["Agent Email"],
-            FIELD_MAPPING["imeis_1"]: responses["IMEIs for phones (textarea 1, line separated)"],
-            FIELD_MAPPING["imeis_2"]: responses["IMEIs for phones (textarea 2, line separated)"],
+            FIELD_MAPPING["imeis_1"]: responses["IMEIs for phones (textarea 1, line-separated)"],
+            FIELD_MAPPING["imeis_2"]: responses["IMEIs for phones (textarea 2, line-separated)"],
             FIELD_MAPPING["rmas"]: responses.get("RMAs (if any, optional)",""),
             FIELD_MAPPING["notes"]: responses.get("Special Notes (optional)",""),
             FIELD_MAPPING["signature"]: signature_b64,
@@ -261,6 +268,13 @@ async def inventory(ctx):
         r = requests.post(JOTFORM_URL, data=payload)
         if r.status_code == 200:
             await user.send("✅ Inventory submitted successfully!")
+            # Mod alert if after 12PM Monday
+            now = datetime.now()
+            if now.weekday() == 0 and now.hour >= 12:
+                guild = bot.guilds[0]
+                role = discord.utils.get(guild.roles, id=MOD_ROLE_ID)
+                if role:
+                    await guild.system_channel.send(f"⚠️ Inventory submitted after 12PM on Monday by {user.mention}", allowed_mentions=discord.AllowedMentions(roles=True))
         else:
             await user.send(f"❌ Submission failed. Status code: {r.status_code}")
 
@@ -271,9 +285,9 @@ async def inventory(ctx):
 @bot.event
 async def on_ready():
     print(f"{bot.user.name} is online!")
-    channel = bot.get_channel(SALES_CHANNEL_ID)
+    channel = bot.get_channel(GENERAL_CHANNEL_ID)
     if channel:
         await channel.send("I'm Here!")
-    send_quotes.start()
+    send_quote_daily.start()
 
 bot.run(TOKEN)
