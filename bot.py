@@ -11,10 +11,12 @@ from flask import Flask
 import threading
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
+import feedparser
 
 # --- Environment Variables ---
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", 0))  # Optional: mod role for special commands
 
 if not TOKEN or not CHANNEL_ID:
     raise ValueError("TOKEN and CHANNEL_ID must be set in env")
@@ -29,7 +31,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 user_zips = {}           # user_id: {zip, lat, lon}
 sales_data = {}          # user_id: {"emoji": "🛒", "daily": 0, "weekly": 0}
 posted_alerts = {}       # alert_id: end_datetime
-quiet_until = None
+quiet_until = None       # datetime for quiet mode
+sandbox_mode = False
 tf = TimezoneFinder()
 
 DATA_FILE = "lumina_data.json"
@@ -92,10 +95,7 @@ def to_local_time(utc_str, lat, lon):
     return utc_str
 
 # --- Weather RSS ---
-import feedparser
-
 def check_weather_rss(lat, lon):
-    # NOAA RSS feed example (replace with relevant URL)
     feed_url = f"https://alerts.weather.gov/cap/us.php?x={lat},{lon}"
     feed = feedparser.parse(feed_url)
     new_alerts = []
@@ -223,6 +223,26 @@ async def on_member_join(member):
     if channel:
         await channel.send(f"👋 Welcome {member.mention} to the server!")
 
+# --- Quiet Mode ---
+@bot.command()
+async def quiet(ctx, hours: int):
+    global quiet_until
+    if MOD_ROLE_ID and MOD_ROLE_ID not in [r.id for r in ctx.author.roles]:
+        await ctx.send("❌ You do not have permission to activate quiet mode.")
+        return
+    quiet_until = datetime.utcnow() + timedelta(hours=hours)
+    await ctx.send(f"🤫 Quiet mode activated for {hours} hours.")
+
+# --- Sandbox Mode ---
+@bot.command()
+async def sandbox(ctx, state: str):
+    global sandbox_mode
+    if MOD_ROLE_ID and MOD_ROLE_ID not in [r.id for r in ctx.author.roles]:
+        await ctx.send("❌ You do not have permission to change sandbox mode.")
+        return
+    sandbox_mode = state.lower() in ["on", "true", "1"]
+    await ctx.send(f"🧪 Sandbox mode is now {'ON' if sandbox_mode else 'OFF'}.")
+
 # --- Inventory DM submission ---
 @bot.command()
 async def inventory(ctx):
@@ -280,8 +300,12 @@ async def inventory(ctx):
         "q18_pleaseLeave18": answers["notes"],
     }
     files = {"q11_signature": ("signature.png", img_bytes, "image/png")}
-    res = requests.post(form_url, data=payload, files=files)
-    await user.send("✅ Inventory submitted successfully!" if res.status_code==200 else "❌ Submission failed.")
+    
+    if sandbox_mode:
+        await user.send("🧪 Sandbox mode active: submission not sent.")
+    else:
+        res = requests.post(form_url, data=payload, files=files)
+        await user.send("✅ Inventory submitted successfully!" if res.status_code==200 else "❌ Submission failed.")
 
 # --- Bot ready ---
 @bot.event
@@ -289,7 +313,7 @@ async def on_ready():
     print(f"{bot.user.name} is online!")
     channel = bot.get_channel(CHANNEL_ID)
     if channel:
-        await channel.send("I'm Here!")
+        await channel.send("I'm online and operational!")
     send_quotes.start()
     weather_monitor.start()
 
